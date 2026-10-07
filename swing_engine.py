@@ -45,24 +45,38 @@ def _clean_columns(df):
 
 
 def _extract_ticker(batch, ticker):
+    """Extract one ticker robustly from either yfinance MultiIndex layout."""
     if batch is None or batch.empty:
         return None
-    t = ticker.upper()
-    if not isinstance(batch.columns, pd.MultiIndex):
-        return _clean_columns(batch.copy())
-    cols0 = [str(x).upper() for x in batch.columns.get_level_values(0)]
-    cols1 = [str(x).upper() for x in batch.columns.get_level_values(1)]
-    try:
-        if t in cols1:
-            out = batch.xs(t, axis=1, level=1, drop_level=True).copy()
-            return _clean_columns(out)
-        if t in cols0:
-            out = batch.xs(t, axis=1, level=0, drop_level=True).copy()
-            return _clean_columns(out)
-    except Exception:
-        pass
-    return None
 
+    t = str(ticker).upper().strip()
+
+    try:
+        if not isinstance(batch.columns, pd.MultiIndex):
+            return _clean_columns(batch.copy())
+
+        for level in range(batch.columns.nlevels):
+            values = batch.columns.get_level_values(level)
+            matches = [i for i, v in enumerate(values)
+                       if str(v).upper().strip() == t]
+            if not matches:
+                continue
+
+            out = batch.iloc[:, matches].copy()
+
+            # Drop the ticker level and leave OHLCV field names.
+            other_levels = [i for i in range(batch.columns.nlevels) if i != level]
+            if len(other_levels) == 1:
+                out.columns = [
+                    str(batch.columns[i][other_levels[0]]).strip().title()
+                    for i in matches
+                ]
+            return _clean_columns(out)
+
+    except Exception:
+        return None
+
+    return None
 
 @st.cache_data(ttl=900, max_entries=30, show_spinner=False)
 def download_batch(tickers, period, interval):
@@ -103,8 +117,19 @@ class MarketData:
     def daily(self, ticker): return _extract_ticker(self.daily6, ticker)
     def weekly(self, ticker):
         df = _extract_ticker(self.weekly2, ticker)
-        if df is not None and len(df) > 1:
-            df = df.iloc[:-1].copy()  # completed weeks only, same as validated engine
+        if df is None or df.empty:
+            return None
+
+        for col in ["Open", "High", "Low", "Close", "Volume"]:
+            if col in df.columns:
+                df[col] = pd.to_numeric(df[col], errors="coerce")
+
+        df = df.dropna(subset=["Close"]).copy()
+
+        # Ignore the current, potentially incomplete week.
+        if len(df) > 1:
+            df = df.iloc[:-1].copy()
+
         return df
     def price_daily(self, ticker): return _extract_ticker(self.daily5, ticker)
 
@@ -180,9 +205,22 @@ def fetch_ma30w_from_data(ticker, weekly, daily5, benchmark_weekly):
         price=float(daily5["Close"].iloc[-1])
         rs=None
         if benchmark_weekly is not None and len(close)>RS_WEEKS:
-            b=benchmark_weekly.reindex(close.index,method="ffill")
-            if not b.isna().iloc[-RS_WEEKS-1:].any():
-                rs=float((close.iloc[-1]/close.iloc[-RS_WEEKS-1]-1)-(b.iloc[-1]/b.iloc[-RS_WEEKS-1]-1))
+            # Accept either a Close Series or a weekly DataFrame.
+            if isinstance(benchmark_weekly, pd.DataFrame):
+                benchmark_weekly = (
+                    benchmark_weekly["Close"]
+                    if "Close" in benchmark_weekly.columns
+                    else None
+                )
+            if benchmark_weekly is not None:
+                b = pd.to_numeric(
+                    benchmark_weekly, errors="coerce"
+                ).reindex(close.index, method="ffill")
+                if not b.isna().iloc[-RS_WEEKS-1:].any():
+                    rs = float(
+                        (close.iloc[-1] / close.iloc[-RS_WEEKS-1] - 1)
+                        - (b.iloc[-1] / b.iloc[-RS_WEEKS-1] - 1)
+                    )
         vol_ratio=None
         if "Volume" in weekly.columns and len(weekly)>VOL_BASE_WEEKS+1:
             vol=weekly["Volume"].astype(float); base=vol.iloc[-VOL_BASE_WEEKS-1:-1].mean()
@@ -1161,7 +1199,12 @@ def historical_stage2_reliability_from_data(ticker, daily, benchmark_daily):
 
 def analyze_tickers(tickers, data):
     results=[]
-    bench=data.weekly(RS_BENCHMARK)
+    bench_df = data.weekly(RS_BENCHMARK)
+    bench = (
+        bench_df["Close"].astype(float)
+        if bench_df is not None and "Close" in bench_df.columns
+        else None
+    )
     for ticker in tickers:
         f=fetch_features_from_df(ticker, data.daily(ticker))
         if not f: continue
