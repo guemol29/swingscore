@@ -75,23 +75,6 @@ def download_batch(tickers, period, interval):
     )
 
 
-@st.cache_data(ttl=900, max_entries=100, show_spinner=False)
-def download_one(ticker, period, interval):
-    ticker = str(ticker).upper().strip()
-    if not ticker:
-        return None
-    try:
-        df = yf.download(
-            ticker, period=period, interval=interval,
-            progress=False, auto_adjust=True, threads=False,
-        )
-        if df is None or df.empty:
-            return None
-        return _clean_columns(df)
-    except Exception:
-        return None
-
-
 @st.cache_data(ttl=900, max_entries=30, show_spinner=False)
 def download_reliability_batch(tickers):
     syms = tuple(dict.fromkeys(str(x).upper().strip() for x in tickers if str(x).strip()))
@@ -99,7 +82,7 @@ def download_reliability_batch(tickers):
         return pd.DataFrame()
     return yf.download(
         list(syms), period=f"{BACKTEST_YEARS}y", interval="1d",
-        progress=False, auto_adjust=True, group_by="column", threads=True,
+        progress=False, auto_adjust=True, group_by="column", threads=False,
     )
 
 
@@ -114,38 +97,16 @@ class MarketData:
         self.tickers = tuple(dict.fromkeys([t.upper() for t in tickers] + [RS_BENCHMARK]))
         self.daily6 = download_batch(self.tickers, "6mo", "1d")
         self.weekly2 = download_batch(self.tickers, "2y", "1wk")
-        self.daily5 = None  # no separate request needed; use latest 6mo daily close
+        self.daily5 = download_batch(self.tickers, "5d", "1d")
         self.reliability = None
-        # Yahoo can occasionally return a partial batch. Repair only missing symbols
-        # with individual requests, keeping the fast batch path for normal cases.
-        self._daily_fallback = {}
-        self._weekly_fallback = {}
-        for ticker in self.tickers:
-            if _extract_ticker(self.daily6, ticker) is None:
-                df = download_one(ticker, "6mo", "1d")
-                if df is not None:
-                    self._daily_fallback[ticker] = df
-            if _extract_ticker(self.weekly2, ticker) is None:
-                df = download_one(ticker, "2y", "1wk")
-                if df is not None:
-                    self._weekly_fallback[ticker] = df
 
-    def daily(self, ticker):
-        df = _extract_ticker(self.daily6, ticker)
-        return df if df is not None else self._daily_fallback.get(str(ticker).upper())
-
+    def daily(self, ticker): return _extract_ticker(self.daily6, ticker)
     def weekly(self, ticker):
         df = _extract_ticker(self.weekly2, ticker)
-        if df is None:
-            df = self._weekly_fallback.get(str(ticker).upper())
         if df is not None and len(df) > 1:
             df = df.iloc[:-1].copy()  # completed weeks only, same as validated engine
         return df
-
-    def price_daily(self, ticker):
-        # Use the same 6-month daily dataset as the Score calculation. This avoids
-        # a second short download that can fail independently.
-        return self.daily(ticker)
+    def price_daily(self, ticker): return _extract_ticker(self.daily5, ticker)
 
     def load_reliability(self, tickers):
         syms = tuple(dict.fromkeys([t.upper() for t in tickers] + [RS_BENCHMARK]))
@@ -158,7 +119,17 @@ class MarketData:
 
 def fetch_features_from_df(ticker, df):
     try:
-        if df is None or len(df) < MIN_PERIODS: return None
+        if df is None or df.empty: return None
+        # Yahoo Finance batch downloads can occasionally contain trailing
+        # NaN rows for one or more tickers.  Remove incomplete OHLC rows
+        # before calculating the score; otherwise NaN values can make
+        # _clamp() produce a misleading score of 1.0 and a blank price.
+        df = df.copy()
+        for col in ("Close", "High", "Low"):
+            if col in df.columns:
+                df[col] = pd.to_numeric(df[col], errors="coerce")
+        df = df.dropna(subset=["Close", "High", "Low"])
+        if len(df) < MIN_PERIODS: return None
         closes = df["Close"].values.flatten().astype(float)
         highs = df["High"].values.flatten().astype(float)
         lows = df["Low"].values.flatten().astype(float)
@@ -202,15 +173,14 @@ def fetch_ma30w_from_data(ticker, weekly, daily5, benchmark_weekly):
         close=weekly["Close"].astype(float); ma=close.rolling(MA_WEEKS).mean().values
         ma_now=ma[-1]; ma_prev=ma[-1-MA_SLOPE_LOOKBACK]
         if daily5 is None or daily5.empty: return None
+        daily5 = daily5.copy()
+        daily5["Close"] = pd.to_numeric(daily5["Close"], errors="coerce")
+        daily5 = daily5.dropna(subset=["Close"])
+        if daily5.empty: return None
         price=float(daily5["Close"].iloc[-1])
         rs=None
         if benchmark_weekly is not None and len(close)>RS_WEEKS:
-            # MarketData.weekly() returns an OHLCV DataFrame; use its Close series.
-            if isinstance(benchmark_weekly, pd.DataFrame):
-                b = benchmark_weekly["Close"].astype(float)
-            else:
-                b = benchmark_weekly.astype(float)
-            b = b.reindex(close.index, method="ffill")
+            b=benchmark_weekly.reindex(close.index,method="ffill")
             if not b.isna().iloc[-RS_WEEKS-1:].any():
                 rs=float((close.iloc[-1]/close.iloc[-RS_WEEKS-1]-1)-(b.iloc[-1]/b.iloc[-RS_WEEKS-1]-1))
         vol_ratio=None
